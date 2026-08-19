@@ -3,73 +3,90 @@
  *
  * How we run it:
  *   - The path to a toolkit's catalog JSON is passed as a CLI ARGUMENT, e.g.
- *     `node --import tsx src/generate.ts path/to/catalog.json`. We append it as the last
- *     argument, so reading the final argv entry works whatever else your command carries.
+ *     `node --import tsx src/generate.ts path/to/catalog.json`. We append it after your
+ *     run command, so reading the final argv entry works whatever else the command carries.
  *   - Write your graph to `dependency_graph.json` in the working directory.
- *   - For LLM access, the OpenAI SDK reads OPENAI_API_KEY / OPENAI_BASE_URL from the
- *     environment (set from your assessment page's AI credentials; the same are provided
- *     when we run your generator). Use an OpenRouter model id such as `openai/gpt-4o`.
- *
- * This is a SKELETON. Replace the inference in generate() with your own approach. Do not
- * hardcode a toolkit's relations: your node ids must be slugs from the catalog you are
- * handed, and your output must change when the input changes.
+ *   - LLM credentials: OPENAI_API_KEY / OPENAI_BASE_URL (grader-injected). Fallback base
+ *     URL is the Litmus proxy. Model: openai/gpt-4o.
  */
-import { readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
+import { refineLeftovers } from "./llm";
+import { buildNodes, cleanEdges, indexTools, matchDependencies } from "./match";
+import { slugOf } from "./schema";
+import type { Graph, Tool } from "./types";
+import { writeVisualization } from "./visualize";
 
-type Tool = Record<string, any>;
-interface Node {
-  id: string;
-  service?: string;
-}
-interface Edge {
-  from: string;
-  to: string;
-  label?: string;
-}
-interface Graph {
-  nodes: Node[];
-  edges: Edge[];
-}
-
-// The catalog path is the last CLI argument (we append it after your run command).
 const CATALOG_PATH = process.argv.length > 2 ? process.argv[process.argv.length - 1] : undefined;
 const OUT_PATH = "dependency_graph.json";
+const LITMUS_BASE = "https://litmus-production.up.railway.app/proxy/openai/v1";
+
+/** Node does not load .env on its own. Grader-injected env wins over the file. */
+function loadDotEnv(): void {
+  const envPath = ".env";
+  if (!existsSync(envPath)) return;
+  for (const raw of readFileSync(envPath, "utf-8").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq < 1) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (key && process.env[key] === undefined) process.env[key] = value;
+  }
+  if (!process.env.OPENAI_BASE_URL) process.env.OPENAI_BASE_URL = LITMUS_BASE;
+}
 
 function loadCatalog(): Tool[] {
   if (!CATALOG_PATH) {
     throw new Error("pass the toolkit catalog path as the first argument");
   }
   const data = JSON.parse(readFileSync(CATALOG_PATH, "utf-8"));
-  // getRawComposioTools returns a list of tools (or { tools: [...] }).
   return Array.isArray(data) ? data : (data.tools ?? data.items ?? []);
 }
 
-function slugOf(tool: Tool): string | undefined {
-  return tool.slug ?? tool.name ?? tool.function?.name;
-}
-
-/**
- * TODO: your inference goes here.
- *
- * The baseline below emits every tool as a node and no edges. It passes the
- * "nodes are real slugs" check but scores ~0 on correctness (no dependencies) and
- * will fail the has-edges gate. Replace it: for each tool's required inputs, infer
- * which other tools produce a matching output id/field, and emit those edges.
- * Runtime LLM inference is encouraged. Keep node ids sourced from the catalog you
- * were given.
- */
 async function generate(tools: Tool[]): Promise<Graph> {
-  const nodes: Node[] = tools
-    .map(slugOf)
-    .filter((s): s is string => !!s)
-    .map((id) => ({ id }));
-  const edges: Edge[] = [];
+  const indexed = indexTools(tools);
+  const { edges: heuristicEdges, leftovers } = matchDependencies(indexed);
+  console.error(
+    `heuristic: ${heuristicEdges.length} edges, ${leftovers.length} leftover needs`,
+  );
+
+  let llmEdges: Graph["edges"] = [];
+  try {
+    llmEdges = await refineLeftovers(leftovers);
+    console.error(`llm: ${llmEdges.length} extra edges`);
+  } catch (err) {
+    console.error(`llm failed, keeping heuristic graph: ${(err as Error).message}`);
+  }
+
+  const slugs = new Set(indexed.map((t) => t.slug));
+  const edges = cleanEdges([...heuristicEdges, ...llmEdges], slugs);
+  const nodes = buildNodes(indexed);
+
+  if (nodes.length === 0) {
+    return {
+      nodes: tools
+        .map(slugOf)
+        .filter((s): s is string => !!s)
+        .map((id) => ({ id })),
+      edges: [],
+    };
+  }
+
   return { nodes, edges };
 }
 
 async function main() {
+  loadDotEnv();
   const graph = await generate(loadCatalog());
   writeFileSync(OUT_PATH, JSON.stringify(graph, null, 2), "utf-8");
+  writeVisualization(graph);
   console.error(
     `wrote ${graph.nodes.length} nodes, ${graph.edges.length} edges to ${OUT_PATH}`,
   );
