@@ -84,9 +84,10 @@ async function generate(tools: Tool[]): Promise<Graph> {
 
 async function main() {
   loadDotEnv();
-  const graph = await generate(loadCatalog());
+  const tools = loadCatalog();
+  const graph = await generate(tools);
   writeFileSync(OUT_PATH, JSON.stringify(graph, null, 2), "utf-8");
-  writeVisualization(graph);
+  writeVisualization(graph, tools);
   console.error(
     `wrote ${graph.nodes.length} nodes, ${graph.edges.length} edges to ${OUT_PATH}`,
   );

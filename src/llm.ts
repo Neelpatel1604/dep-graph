@@ -2,10 +2,14 @@ import OpenAI from "openai";
 import type { Edge, Leftover } from "./types";
 
 const FALLBACK_BASE = "https://litmus-production.up.railway.app/proxy/openai/v1";
-const MODEL = "openai/gpt-4o";
+const DEFAULT_MODEL = "openai/gpt-4o";
 const BATCH_SIZE = 4;
 const MAX_BATCHES = 16;
 const MIN_CONFIDENCE = 0.6;
+
+function modelId(): string {
+  return process.env.OPENAI_MODEL?.trim() || DEFAULT_MODEL;
+}
 
 const SYSTEM_PROMPT = `You infer tool-to-tool dependency edges for an API toolkit catalog.
 An edge means: run producer first so its output can fill a required input on the consumer.
@@ -44,6 +48,9 @@ export async function refineLeftovers(leftovers: Leftover[]): Promise<Edge[]> {
     return [];
   }
 
+  const model = modelId();
+  console.error(`llm model: ${model}`);
+
   const prioritized = [
     ...leftovers.filter((l) => l.reason === "none"),
     ...leftovers.filter((l) => l.reason === "ambiguous"),
@@ -70,7 +77,7 @@ export async function refineLeftovers(leftovers: Leftover[]): Promise<Edge[]> {
 
     try {
       const response = await openai.chat.completions.create({
-        model: MODEL,
+        model,
         response_format: { type: "json_object" },
         temperature: 0,
         messages: [
